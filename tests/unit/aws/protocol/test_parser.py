@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from io import BytesIO
 from urllib.parse import unquote, urlencode, urlsplit
 
 import pytest
@@ -15,7 +16,6 @@ from localstack.aws.protocol.parser import (
 )
 from localstack.aws.spec import load_service
 from localstack.http import Request as HttpRequest
-from localstack.services.s3 import s3_utils
 from localstack.utils.common import to_bytes, to_str
 
 
@@ -42,9 +42,9 @@ def test_query_parser():
     }
 
 
-def test_sqs_parse_tag_map_with_member_name_as_location():
+def test_sqs_query_parse_tag_map_with_member_name_as_location():
     # see https://github.com/localstack/localstack/issues/4391
-    parser = create_parser(load_service("sqs"))
+    parser = create_parser(load_service("sqs-query"))
 
     # with "Tag." it works (this is the default request)
     request = HttpRequest(
@@ -90,6 +90,54 @@ def test_sqs_parse_tag_map_with_member_name_as_location():
     }
 
 
+def test_sqs_query_parse_map_with_nested_dict():
+    # see https://github.com/localstack/localstack/issues/10949
+    parser = create_parser(load_service("sqs-query"))
+
+    # with "MessageAttribute." it works (this is the default request)
+    request = HttpRequest(
+        "POST",
+        "/",
+        body="Action=SendMessage&"
+        "MessageBody=foobar&"
+        "QueueUrl=http://localhost:4566/000000000000/foobar&"
+        "MessageAttribute.1.Name=Foo&"
+        "MessageAttribute.1.Value.DataType=String&"
+        "MessageAttribute.1.Value.StringValue=Bar",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+
+    operation, params = parser.parse(request)
+    assert operation.name == "SendMessage"
+    assert params == {
+        "QueueUrl": "http://localhost:4566/000000000000/foobar",
+        "MessageBody": "foobar",
+        "MessageAttributes": {"Foo": {"DataType": "String", "StringValue": "Bar"}},
+    }
+
+    # Aws also accepts MessageAttributes. Most likely related to issue
+    # https://github.com/localstack/localstack/issues/4391
+    request = HttpRequest(
+        "POST",
+        "/",
+        body="Action=SendMessage&"
+        "MessageBody=foobar&"
+        "QueueUrl=http://localhost:4566/000000000000/foobar&"
+        "MessageAttributes.1.Name=Foo&"
+        "MessageAttributes.1.Value.DataType=String&"
+        "MessageAttributes.1.Value.StringValue=Bar",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+
+    operation, params = parser.parse(request)
+    assert operation.name == "SendMessage"
+    assert params == {
+        "QueueUrl": "http://localhost:4566/000000000000/foobar",
+        "MessageAttributes": {"Foo": {"DataType": "String", "StringValue": "Bar"}},
+        "MessageBody": "foobar",
+    }
+
+
 def test_query_parser_uri():
     """
     Basic test for the QueryParser with a simple example (SQS SendMessage request),
@@ -115,7 +163,7 @@ def test_query_parser_uri():
 
 def test_query_parser_flattened_map():
     """Simple test with a flattened map (SQS SetQueueAttributes request)."""
-    parser = QueryRequestParser(load_service("sqs"))
+    parser = QueryRequestParser(load_service("sqs-query"))
     request = HttpRequest(
         body=to_bytes(
             "Action=SetQueueAttributes&Version=2012-11-05&"
@@ -249,7 +297,7 @@ def test_query_parser_non_flattened_list_structure_changed_name():
 
 def test_query_parser_flattened_list_structure():
     """Simple test with a flattened list of structures."""
-    parser = QueryRequestParser(load_service("sqs"))
+    parser = QueryRequestParser(load_service("sqs-query"))
     request = HttpRequest(
         body=to_bytes(
             "Action=DeleteMessageBatch&"
@@ -300,6 +348,15 @@ def _botocore_parser_integration_test(
 
     operation_model = service.operation_model(action)
     serialized_request = serializer.serialize_to_request(kwargs, operation_model)
+
+    # botocore >= 1.28 might modify the url path of the request dict (specifically for S3).
+    # It will then set the original url path as "auth_path". If the auth_path is set, we reset the url_path.
+    # Since botocore 1.31.2, botocore will strip the query from the `authPart`
+    # We need to add it back from `requestUri` field
+    if auth_path := serialized_request.get("auth_path"):
+        path, sep, query = serialized_request["url_path"].partition("?")
+        serialized_request["url_path"] = f"{auth_path}{sep}{query}"
+
     prepare_request_dict(serialized_request, "")
     split_url = urlsplit(serialized_request.get("url"))
     path = split_url.path
@@ -376,7 +433,7 @@ def test_query_parser_sqs_with_botocore():
 
 def test_query_parser_empty_required_members_sqs_with_botocore():
     _botocore_parser_integration_test(
-        service="sqs",
+        service="sqs-query",
         action="SendMessageBatch",
         QueueUrl="string",
         Entries=[],
@@ -388,6 +445,22 @@ def test_query_parser_no_input_shape_autoscaling_with_botocore():
     _botocore_parser_integration_test(
         service="autoscaling",
         action="DescribeMetricCollectionTypes",
+    )
+
+
+def test_query_parser_iot_with_botocore():
+    """Test if timestamp for 'rest-json' is parsed correctly"""
+    start = datetime(2023, 1, 10, tzinfo=timezone.utc)
+    end = datetime(2023, 1, 11, tzinfo=timezone.utc)
+    _botocore_parser_integration_test(
+        service="iot",
+        action="ListAuditMitigationActionsTasks",
+        endTime=end,
+        startTime=start,
+        expected={
+            "endTime": end,
+            "startTime": start,
+        },
     )
 
 
@@ -553,6 +626,104 @@ def test_json_parser_cognito_with_botocore():
     )
 
 
+def test_json_cbor_blob_parsing():
+    serialized_request = {
+        "url_path": "/",
+        "query_string": "",
+        "method": "POST",
+        "headers": {
+            "Host": "localhost:4566",
+            "amz-sdk-invocation-id": "d77968c6-b536-155d-7228-d4dfe6372154",
+            "amz-sdk-request": "attempt=1; max=3",
+            "Content-Length": "103",
+            "Content-Type": "application/x-amz-cbor-1.1",
+            "X-Amz-Date": "20220721T081553Z",
+            "X-Amz-Target": "Kinesis_20131202.PutRecord",
+            "x-localstack-tgt-api": "kinesis",
+        },
+        "body": b"\xbfjStreamNamedtestdDataMhello, world!lPartitionKeylpartitionkey\xff",
+        "url": "/",
+        "context": {},
+    }
+
+    prepare_request_dict(serialized_request, "")
+    split_url = urlsplit(serialized_request.get("url"))
+    path = split_url.path
+    query_string = split_url.query
+
+    # Use our parser to parse the serialized body
+    # Load the appropriate service
+    service = load_service("kinesis")
+    operation_model = service.operation_model("PutRecord")
+    parser = create_parser(service)
+    parsed_operation_model, parsed_request = parser.parse(
+        HttpRequest(
+            method=serialized_request.get("method") or "GET",
+            path=unquote(path),
+            query_string=to_str(query_string),
+            headers=serialized_request.get("headers"),
+            body=serialized_request["body"],
+            raw_path=path,
+        )
+    )
+
+    # Check if the determined operation_model is correct
+    assert parsed_operation_model == operation_model
+
+    assert "Data" in parsed_request
+    assert parsed_request["Data"] == b"hello, world!"
+    assert "StreamName" in parsed_request
+    assert parsed_request["StreamName"] == "test"
+    assert "PartitionKey" in parsed_request
+    assert parsed_request["PartitionKey"] == "partitionkey"
+
+
+def test_json_cbor_blob_parsing_w_timestamp(snapshot):
+    serialized_request = {
+        "url_path": "/",
+        "query_string": "",
+        "method": "POST",
+        "headers": {
+            "Host": "localhost:4566",
+            "amz-sdk-invocation-id": "d77968c6-b536-155d-7228-d4dfe6372154",
+            "amz-sdk-request": "attempt=1; max=3",
+            "Content-Length": "103",
+            "Content-Type": "application/x-amz-cbor-1.1",
+            "X-Amz-Date": "20220721T081553Z",
+            "X-Amz-Target": "Kinesis_20131202.SubscribeToShard",
+            "x-localstack-tgt-api": "kinesis",
+        },
+        "body": b"\xa3kConsumerARNs<test-consumer-arn>gShardIdo<test-shard-id>pStartingPosition\xa2dTypelAT_TIMESTAMPiTimestampm1718960048123",
+        "url": "/",
+        "context": {},
+    }
+
+    prepare_request_dict(serialized_request, "")
+    split_url = urlsplit(serialized_request.get("url"))
+    path = split_url.path
+    query_string = split_url.query
+
+    # Use our parser to parse the serialized body
+    # Load the appropriate service
+    service = load_service("kinesis")
+    operation_model = service.operation_model("SubscribeToShard")
+    parser = create_parser(service)
+    parsed_operation_model, parsed_request = parser.parse(
+        HttpRequest(
+            method=serialized_request.get("method"),
+            path=unquote(path),
+            query_string=to_str(query_string),
+            headers=serialized_request.get("headers"),
+            body=serialized_request["body"],
+            raw_path=path,
+        )
+    )
+
+    # Check if the determined operation_model is correct
+    assert parsed_operation_model == operation_model
+    snapshot.match("parsed_request", parsed_request)
+
+
 def test_restjson_parser_xray_with_botocore():
     _botocore_parser_integration_test(
         service="xray",
@@ -676,7 +847,7 @@ def test_restjson_opensearch_with_botocore():
     )
 
 
-def test_restjson_awslambda_invoke_with_botocore():
+def test_restjson_lambda_invoke_with_botocore():
     _botocore_parser_integration_test(
         service="lambda",
         action="Invoke",
@@ -788,7 +959,7 @@ def test_parse_appconfig_non_json_blob_payload():
         action="CreateHostedConfigurationVersion",
         ApplicationId="test-application-id",
         ConfigurationProfileId="test-configuration-profile-id",
-        Content=b"<html></html>",
+        Content=BytesIO(b"<html></html>"),
         ContentType="application/html",
     )
 
@@ -870,7 +1041,11 @@ def test_restjson_operation_detection_with_query_suffix_in_requesturi():
     Test if the correct operation is detected if the requestURI pattern of the specification contains the first query
     parameter, f.e. API Gateway's ImportRestApi: "/restapis?mode=import
     """
-    _botocore_parser_integration_test(service="apigateway", action="ImportRestApi", body=b"Test")
+    _botocore_parser_integration_test(
+        service="apigateway",
+        action="ImportRestApi",
+        body=BytesIO(b"Test"),
+    )
 
 
 def test_rest_url_parameter_with_dashes():
@@ -989,7 +1164,7 @@ def test_s3_put_object_keys_with_slashes():
         Bucket="test-bucket",
         Key="/test-key",
         ContentLength=6,
-        Body=b"foobar",
+        Body=BytesIO(b"foobar"),
         Metadata={},
     )
 
@@ -1000,6 +1175,17 @@ def test_s3_get_object_keys_with_slashes():
         action="GetObject",
         Bucket="test-bucket",
         Key="/test-key",
+    )
+
+
+def test_s3_put_object_keys_with_trailing_slash_and_special_characters():
+    _botocore_parser_integration_test(
+        service="s3",
+        action="PutObject",
+        Bucket="test-bucket",
+        Key="test@key/",
+        ContentLength=0,
+        Metadata={},
     )
 
 
@@ -1015,6 +1201,24 @@ def test_restxml_headers_parsing():
     )
 
 
+def test_restxml_header_list_parsing():
+    """Tests that list attributes that are encoded into headers are parsed correctly."""
+    _botocore_parser_integration_test(
+        service="s3",
+        action="GetObjectAttributes",
+        Bucket="test-bucket",
+        Key="/test-key",
+        # ObjectAttributesList is a list of strings with location:"header"
+        ObjectAttributes=["ObjectSize", "StorageClass"],
+    )
+
+
+def test_restxml_header_optional_list_parsing():
+    """Tests that non-existing header list attributes are working correctly."""
+    # OptionalObjectAttributes (the "x-amz-optional-object-attributes") in ListObjectsV2Request is optional
+    _botocore_parser_integration_test(service="s3", action="ListObjectsV2", Bucket="test-bucket")
+
+
 def test_restxml_header_date_parsing():
     """Test the parsing of a map with the location trait 'headers'."""
     _botocore_parser_integration_test(
@@ -1023,7 +1227,7 @@ def test_restxml_header_date_parsing():
         Bucket="test-bucket",
         Key="test-key",
         ContentLength=3,
-        Body=b"foo",
+        Body=BytesIO(b"foo"),
         Metadata={},
         Expires=datetime(2015, 1, 1, 0, 0, tzinfo=timezone.utc),
     )
@@ -1031,9 +1235,7 @@ def test_restxml_header_date_parsing():
 
 def test_s3_virtual_host_addressing():
     """Test the parsing of an S3 bucket request using the bucket encoded in the domain."""
-    request = HttpRequest(
-        method="PUT", headers={"host": s3_utils.get_bucket_hostname("test-bucket")}
-    )
+    request = HttpRequest(method="PUT", headers={"host": "test-bucket.s3.example.com"})
     parser = create_parser(load_service("s3"))
     parsed_operation_model, parsed_request = parser.parse(request)
     assert parsed_operation_model.name == "CreateBucket"
@@ -1057,6 +1259,48 @@ def test_s3_list_buckets_with_localhost():
     parser = create_parser(load_service("s3"))
     parsed_operation_model, parsed_request = parser.parse(request)
     assert parsed_operation_model.name == "ListBuckets"
+
+
+def test_s3_get_object_attributes_with_whitespace():
+    # optional whitespace is accepted for ObjectAttributesList, a list of strings with location:"header"
+    request = HttpRequest(
+        "GET",
+        "/bucket/key?attributes",
+        query_string="attributes",
+        headers={
+            "x-amz-object-attributes": "ETag, Checksum, ObjectParts, StorageClass, ObjectSize",
+        },
+    )
+    parser = create_parser(load_service("s3"))
+    parsed_operation_model, parsed_request = parser.parse(request)
+    assert parsed_operation_model.name == "GetObjectAttributes"
+    assert parsed_request["ObjectAttributes"] == [
+        "ETag",
+        "Checksum",
+        "ObjectParts",
+        "StorageClass",
+        "ObjectSize",
+    ]
+
+    # assert that with no whitespace, it is identical
+    request = HttpRequest(
+        "GET",
+        "/bucket/key",
+        query_string="attributes",
+        headers={
+            "x-amz-object-attributes": "ETag,Checksum,ObjectParts,StorageClass,ObjectSize",
+        },
+    )
+    parser = create_parser(load_service("s3"))
+    parsed_operation_model, parsed_request = parser.parse(request)
+    assert parsed_operation_model.name == "GetObjectAttributes"
+    assert parsed_request["ObjectAttributes"] == [
+        "ETag",
+        "Checksum",
+        "ObjectParts",
+        "StorageClass",
+        "ObjectSize",
+    ]
 
 
 def test_s3_list_buckets_with_localhost_and_port():
