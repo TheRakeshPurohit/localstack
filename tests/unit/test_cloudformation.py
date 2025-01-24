@@ -1,39 +1,9 @@
-import re
-from typing import Dict
-
+from localstack.services.cloudformation.api_utils import is_local_service_url
 from localstack.services.cloudformation.deployment_utils import (
     PLACEHOLDER_AWS_NO_VALUE,
     remove_none_values,
 )
-from localstack.services.cloudformation.models.stepfunctions import _apply_substitutions
-from localstack.services.cloudformation.provider import Stack
-from localstack.utils.cloudformation import template_deployer, template_preparer
-
-
-def test_resolve_references():
-    ref = {
-        "Fn::Join": [
-            "",
-            [
-                "arn:",
-                {"Ref": "AWS::Partition"},
-                ":apigateway:",
-                {"Ref": "AWS::Region"},
-                ":lambda:path/2015-03-31/functions/",
-                "test:lambda:arn",
-                "/invocations",
-            ],
-        ]
-    }
-    result = _resolve_refs_in_template(ref)
-    pattern = r"arn:aws:apigateway:.*:lambda:path/2015-03-31/functions/test:lambda:arn/invocations"
-    assert re.match(pattern, result)
-
-
-def test_sub_numeric_value():
-    template = {"test": {"Sub": "${TestNumValue}"}}
-    result = _resolve_refs_in_template(template, stack_params={"TestNumValue": 1234})
-    assert result == {"test": "1234"}
+from localstack.services.cloudformation.engine.template_deployer import order_resources
 
 
 def test_is_local_service_url():
@@ -52,16 +22,9 @@ def test_is_local_service_url():
         "http://mybucket.s3.us-east-1.amazonaws.com",
     ]
     for url in local_urls:
-        assert template_preparer.is_local_service_url(url)
+        assert is_local_service_url(url)
     for url in remote_urls:
-        assert not template_preparer.is_local_service_url(url)
-
-
-def test_apply_substitutions():
-    blubstr = "something ${foo} and ${test} + ${foo}"
-    subs = {"foo": "bar", "test": "resolved"}
-
-    assert _apply_substitutions(blubstr, subs) == "something bar and resolved + bar"
+        assert not is_local_service_url(url)
 
 
 def test_remove_none_values():
@@ -76,10 +39,24 @@ def test_remove_none_values():
     assert result == {"Properties": {"prop1": 123, "nested": {}, "list": [1, 2, 3]}}
 
 
-def _resolve_refs_in_template(template, stack_params: Dict = None):
-    stack = Stack({"StackName": "test"})
-    stack.stack_parameters()
-    stack_params = stack_params or {}
-    stack_params = [{"ParameterKey": k, "ParameterValue": v} for k, v in stack_params.items()]
-    stack.metadata["Parameters"].extend(stack_params)
-    return template_deployer.resolve_refs_recursively(stack, template)
+def test_order_resources():
+    resources: dict[str, dict] = {
+        "B": {
+            "Type": "AWS::SSM::Parameter",
+            "Properties": {
+                "Type": "String",
+                "Value": {
+                    "Ref": "A",
+                },
+            },
+        },
+        "A": {
+            "Type": "AWS::SNS::Topic",
+        },
+    }
+
+    sorted_resources = order_resources(
+        resources=resources, resolved_conditions={}, resolved_parameters={}
+    )
+
+    assert list(sorted_resources.keys()) == ["A", "B"]
