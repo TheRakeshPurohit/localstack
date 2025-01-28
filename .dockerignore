@@ -1,12 +1,12 @@
-.git
 .venv*
-localstack/dashboard/web/node_modules/
-localstack/infra/
-!localstack/infra/stepfunctions
-!localstack/infra/localstack-*.jar
-# TODO: remove, was moved to static_libs dir (currently localstack/infra)
-localstack/node_modules/
-tests/integration/serverless/node_modules/
 
-# ignore files generated in CI build (e.g., large Docker image .tar file)
+.filesystem
+**/.filesystem
+
+# ignore files generated in CI build
+tests/aws/**/node_modules
+tests/aws/**/.terraform
+**/__pycache__
 target/
+htmlcov/
+.coverage

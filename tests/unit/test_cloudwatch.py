@@ -21,7 +21,6 @@ class TestAlarmScheduler:
     TEST_5_M_OF_N = "'- - - X -'"
 
     def test_comparison_operation_mapping(self):
-
         a = 3
         b = 4
 
@@ -252,7 +251,10 @@ def run_and_assert_calculate_alarm_state(
         if expected_calls != 0:
             expected_calls = [
                 call.set_alarm_state(
-                    AlarmName="test-alarm", StateValue=expected_state, StateReason=ANY
+                    AlarmName="test-alarm",
+                    StateValue=expected_state,
+                    StateReason=ANY,
+                    StateReasonData=ANY,
                 )
             ]
             mock_client.assert_has_calls(expected_calls)
